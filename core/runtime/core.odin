@@ -5,6 +5,7 @@ package runtime
 
 import "core:os"
 import "intrinsics"
+_ :: intrinsics;
 
 // Naming Conventions:
 // In general, Ada_Case for types and snake_case for values
@@ -24,7 +25,7 @@ import "intrinsics"
 // implemented within the compiler rather than in this "preload" file
 
 // NOTE(bill): This must match the compiler's
-Calling_Convention :: enum {
+Calling_Convention :: enum u8 {
 	Invalid     = 0,
 	Odin        = 1,
 	Contextless = 2,
@@ -33,11 +34,7 @@ Calling_Convention :: enum {
 	Fast        = 5,
 }
 
-Type_Info_Enum_Value :: union {
-	rune,
-	i8, i16, i32, i64, int,
-	u8, u16, u32, u64, uint, uintptr,
-};
+Type_Info_Enum_Value :: distinct i64;
 
 Platform_Endianness :: enum u8 {
 	Platform = 0,
@@ -56,7 +53,7 @@ Type_Info_Struct_Soa_Kind :: enum u8 {
 Type_Info_Named      :: struct {name: string, base: ^Type_Info};
 Type_Info_Integer    :: struct {signed: bool, endianness: Platform_Endianness};
 Type_Info_Rune       :: struct {};
-Type_Info_Float      :: struct {};
+Type_Info_Float      :: struct {endianness: Platform_Endianness};
 Type_Info_Complex    :: struct {};
 Type_Info_Quaternion :: struct {};
 Type_Info_String     :: struct {is_cstring: bool};
@@ -142,7 +139,15 @@ Type_Info_Simd_Vector :: struct {
 	elem_size:  int,
 	count:      int,
 	is_x86_mmx: bool,
-}
+};
+Type_Info_Relative_Pointer :: struct {
+	pointer:      ^Type_Info,
+	base_integer: ^Type_Info,
+};
+Type_Info_Relative_Slice :: struct {
+	slice:        ^Type_Info,
+	base_integer: ^Type_Info,
+};
 
 Type_Info :: struct {
 	size:  int,
@@ -175,6 +180,8 @@ Type_Info :: struct {
 		Type_Info_Bit_Set,
 		Type_Info_Opaque,
 		Type_Info_Simd_Vector,
+		Type_Info_Relative_Pointer,
+		Type_Info_Relative_Slice,
 	},
 }
 
@@ -204,6 +211,9 @@ Typeid_Kind :: enum u8 {
 	Bit_Field,
 	Bit_Set,
 	Opaque,
+	Simd_Vector,
+	Relative_Pointer,
+	Relative_Slice,
 }
 #assert(len(Typeid_Kind) < 32);
 
@@ -288,9 +298,9 @@ Context :: struct {
 	assertion_failure_proc: Assertion_Failure_Proc,
 	logger:                 Logger,
 
-	stdin:  os.Handle,
-	stdout: os.Handle,
-	stderr: os.Handle,
+	// stdin:  os.Handle,
+	// stdout: os.Handle,
+	// stderr: os.Handle,
 
 	thread_id:  int,
 
@@ -439,6 +449,12 @@ default_logger :: proc() -> Logger {
 }
 
 
+default_context :: proc "contextless" () -> Context {
+	c: Context;
+	__init_context(&c);
+	return c;
+}
+
 @private
 __init_context_from_ptr :: proc "contextless" (c: ^Context, other: ^Context) {
 	if c == nil do return;
@@ -463,9 +479,9 @@ __init_context :: proc "contextless" (c: ^Context) {
 	c.logger.procedure = default_logger_proc;
 	c.logger.data = nil;
 
-	c.stdin  = os.stdin;
-	c.stdout = os.stdout;
-	c.stderr = os.stderr;
+	// c.stdin  = os.stdin;
+	// c.stdout = os.stdout;
+	// c.stderr = os.stderr;
 }
 
 @builtin
@@ -474,7 +490,7 @@ init_global_temporary_allocator :: proc(data: []byte, backup_allocator := contex
 }
 
 default_assertion_failure_proc :: proc(prefix, message: string, loc: Source_Code_Location) {
-	fd := context.stderr;
+	fd := os.stderr;
 	print_caller_location(fd, loc);
 	os.write_string(fd, " ");
 	os.write_string(fd, prefix);
@@ -511,7 +527,7 @@ copy :: proc{copy_slice, copy_from_string};
 
 
 @builtin
-pop :: proc "contextless" (array: ^$T/[dynamic]$E) -> E {
+pop :: proc(array: ^$T/[dynamic]$E) -> E {
 	if array == nil do return E{};
 	assert(len(array) > 0);
 	res := #no_bounds_check array[len(array)-1];
@@ -608,7 +624,10 @@ new_clone :: inline proc(data: $T, allocator := context.allocator, loc := #calle
 make_aligned :: proc($T: typeid/[]$E, auto_cast len: int, alignment: int, allocator := context.allocator, loc := #caller_location) -> T {
 	make_slice_error_loc(loc, len);
 	data := mem_alloc(size_of(E)*len, alignment, allocator, loc);
-	if data == nil do return nil;
+	if data == nil && size_of(E) != 0 {
+		return nil;
+	}
+	// mem_zero(data, size_of(E)*len);
 	s := Raw_Slice{data, len};
 	return transmute(T)s;
 }
@@ -633,9 +652,10 @@ make_dynamic_array_len_cap :: proc($T: typeid/[dynamic]$E, auto_cast len: int, a
 	make_dynamic_array_error_loc(loc, len, cap);
 	data := mem_alloc(size_of(E)*cap, align_of(E), allocator, loc);
 	s := Raw_Dynamic_Array{data, len, cap, allocator};
-	if data == nil {
+	if data == nil && size_of(E) != 0 {
 		s.len, s.cap = 0, 0;
 	}
+	// mem_zero(data, size_of(E)*cap);
 	return transmute(T)s;
 }
 
@@ -689,17 +709,19 @@ append_elem :: proc(array: ^$T/[dynamic]$E, arg: E, loc := #caller_location)  {
 
 	arg_len := 1;
 
-	if cap(array) <= len(array)+arg_len {
+	if cap(array) < len(array)+arg_len {
 		cap := 2 * cap(array) + max(8, arg_len);
 		_ = reserve(array, cap, loc);
 	}
 	arg_len = min(cap(array)-len(array), arg_len);
 	if arg_len > 0 {
 		a := (^Raw_Dynamic_Array)(array);
-		data := (^E)(a.data);
-		assert(data != nil);
-		val := arg;
-		mem_copy(ptr_offset(data, a.len), &val, size_of(E));
+		if size_of(E) != 0 {
+			data := (^E)(a.data);
+			assert(data != nil);
+			val := arg;
+			mem_copy(ptr_offset(data, a.len), &val, size_of(E));
+		}
 		a.len += arg_len;
 	}
 }
@@ -711,16 +733,18 @@ append_elems :: proc(array: ^$T/[dynamic]$E, args: ..E, loc := #caller_location)
 	if arg_len <= 0 do return;
 
 
-	if cap(array) <= len(array)+arg_len {
+	if cap(array) < len(array)+arg_len {
 		cap := 2 * cap(array) + max(8, arg_len);
 		_ = reserve(array, cap, loc);
 	}
 	arg_len = min(cap(array)-len(array), arg_len);
 	if arg_len > 0 {
 		a := (^Raw_Dynamic_Array)(array);
-		data := (^E)(a.data);
-		assert(data != nil);
-		mem_copy(ptr_offset(data, a.len), &args[0], size_of(E) * arg_len);
+		if size_of(E) != 0 {
+			data := (^E)(a.data);
+			assert(data != nil);
+			mem_copy(ptr_offset(data, a.len), &args[0], size_of(E) * arg_len);
+		}
 		a.len += arg_len;
 	}
 }
@@ -1255,7 +1279,7 @@ __get_map_key :: proc "contextless" (k: $K) -> Map_Key {
 	return map_key;
 }
 
-_fnv64a :: proc(data: []byte, seed: u64 = 0xcbf29ce484222325) -> u64 {
+_fnv64a :: proc "contextless" (data: []byte, seed: u64 = 0xcbf29ce484222325) -> u64 {
 	h: u64 = seed;
 	for b in data {
 		h = (h ~ u64(b)) * 0x100000001b3;
@@ -1264,10 +1288,10 @@ _fnv64a :: proc(data: []byte, seed: u64 = 0xcbf29ce484222325) -> u64 {
 }
 
 
-default_hash :: proc(data: []byte) -> u64 {
+default_hash :: proc "contextless" (data: []byte) -> u64 {
 	return _fnv64a(data);
 }
-default_hash_string :: proc(s: string) -> u64 do return default_hash(transmute([]byte)(s));
+default_hash_string :: proc "contextless" (s: string) -> u64 do return default_hash(transmute([]byte)(s));
 
 
 source_code_location_hash :: proc(s: Source_Code_Location) -> u64 {

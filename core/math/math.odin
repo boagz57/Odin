@@ -1,6 +1,7 @@
 package math
 
 import "intrinsics"
+_ :: intrinsics;
 
 Float_Class :: enum {
 	Normal,    // an ordinary nonzero floating point value
@@ -115,7 +116,7 @@ unlerp     :: proc{unlerp_f32, unlerp_f64};
 
 wrap :: proc(x, y: $T) -> T where intrinsics.type_is_numeric(T), !intrinsics.type_is_array(T) {
 	tmp := mod(x, y);
-	return wrap + tmp if tmp < 0 else tmp;
+	return y + tmp if tmp < 0 else tmp;
 }
 angle_diff :: proc(a, b: $T) -> T where intrinsics.type_is_numeric(T), !intrinsics.type_is_array(T) {
 
@@ -742,10 +743,10 @@ atan2_f64 :: proc(y, x: f64) -> f64 {
 atan2 :: proc{atan2_f32, atan2_f64};
 
 atan_f32 :: proc(x: f32) -> f32 {
-	return atan2_f32(1, x);
+	return atan2_f32(x, 1);
 }
 atan_f64 :: proc(x: f64) -> f64 {
-	return atan2_f64(1, x);
+	return atan2_f64(x, 1);
 }
 atan :: proc{atan_f32, atan_f64};
 

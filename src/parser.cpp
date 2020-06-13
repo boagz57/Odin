@@ -24,6 +24,11 @@ Token ast_token(Ast *node) {
 			return ast_token(node->SelectorExpr.selector);
 		}
 		return node->SelectorExpr.token;
+	case Ast_SelectorCallExpr:
+		if (node->SelectorCallExpr.expr != nullptr) {
+			return ast_token(node->SelectorCallExpr.expr);
+		}
+		return node->SelectorCallExpr.token;
 	case Ast_ImplicitSelectorExpr:
 		if (node->ImplicitSelectorExpr.selector != nullptr) {
 			return ast_token(node->ImplicitSelectorExpr.selector);
@@ -87,6 +92,7 @@ Token ast_token(Ast *node) {
 	case Ast_OpaqueType:       return node->OpaqueType.token;
 	case Ast_PolyType:         return node->PolyType.token;
 	case Ast_ProcType:         return node->ProcType.token;
+	case Ast_RelativeType:     return ast_token(node->RelativeType.tag);
 	case Ast_PointerType:      return node->PointerType.token;
 	case Ast_ArrayType:        return node->ArrayType.token;
 	case Ast_DynamicArrayType: return node->DynamicArrayType.token;
@@ -105,7 +111,7 @@ Ast *clone_ast(Ast *node);
 Array<Ast *> clone_ast_array(Array<Ast *> array) {
 	Array<Ast *> result = {};
 	if (array.count > 0) {
-		result = array_make<Ast *>(ast_allocator(), array.count);
+		result = array_make<Ast *>(ast_allocator(nullptr), array.count);
 		for_array(i, array) {
 			result[i] = clone_ast(array[i]);
 		}
@@ -172,6 +178,10 @@ Ast *clone_ast(Ast *node) {
 		break;
 	case Ast_ImplicitSelectorExpr:
 		n->ImplicitSelectorExpr.selector = clone_ast(n->ImplicitSelectorExpr.selector);
+		break;
+	case Ast_SelectorCallExpr:
+		n->SelectorCallExpr.expr = clone_ast(n->SelectorCallExpr.expr);
+		n->SelectorCallExpr.call = clone_ast(n->SelectorCallExpr.call);
 		break;
 	case Ast_IndexExpr:
 		n->IndexExpr.expr  = clone_ast(n->IndexExpr.expr);
@@ -343,6 +353,10 @@ Ast *clone_ast(Ast *node) {
 		n->ProcType.params  = clone_ast(n->ProcType.params);
 		n->ProcType.results = clone_ast(n->ProcType.results);
 		break;
+	case Ast_RelativeType:
+		n->RelativeType.tag  = clone_ast(n->RelativeType.tag);
+		n->RelativeType.type = clone_ast(n->RelativeType.type);
+		break;
 	case Ast_PointerType:
 		n->PointerType.type = clone_ast(n->PointerType.type);
 		break;
@@ -442,9 +456,16 @@ bool ast_node_expect(Ast *node, AstKind kind) {
 }
 
 
+gb_global gbAtomic64 total_allocated_node_memory = {0};
+gb_global gbAtomic64 total_subtype_node_memory_test = {0};
+
 // NOTE(bill): And this below is why is I/we need a new language! Discriminated unions are a pain in C/C++
 Ast *alloc_ast_node(AstFile *f, AstKind kind) {
-	gbAllocator a = ast_allocator();
+	gbAllocator a = ast_allocator(f);
+
+	gb_atomic64_fetch_add(&total_allocated_node_memory, cast(i64)(gb_size_of(Ast)));
+	gb_atomic64_fetch_add(&total_subtype_node_memory_test, cast(i64)(gb_size_of(AstCommonStuff) + ast_variant_sizes[kind]));
+
 	Ast *node = gb_alloc_item(a, Ast);
 	node->kind = kind;
 	node->file = f;
@@ -531,6 +552,14 @@ Ast *ast_implicit_selector_expr(AstFile *f, Token token, Ast *selector) {
 	Ast *result = alloc_ast_node(f, Ast_ImplicitSelectorExpr);
 	result->ImplicitSelectorExpr.token = token;
 	result->ImplicitSelectorExpr.selector = selector;
+	return result;
+}
+
+Ast *ast_selector_call_expr(AstFile *f, Token token, Ast *expr, Ast *call) {
+	Ast *result = alloc_ast_node(f, Ast_SelectorCallExpr);
+	result->SelectorCallExpr.token = token;
+	result->SelectorCallExpr.expr = expr;
+	result->SelectorCallExpr.call = call;
 	return result;
 }
 
@@ -915,7 +944,12 @@ Ast *ast_proc_type(AstFile *f, Token token, Ast *params, Ast *results, u64 tags,
 	return result;
 }
 
-
+Ast *ast_relative_type(AstFile *f, Ast *tag, Ast *type) {
+	Ast *result = alloc_ast_node(f, Ast_RelativeType);
+	result->RelativeType.tag  = tag;
+	result->RelativeType.type = type;
+	return result;
+}
 Ast *ast_pointer_type(AstFile *f, Token token, Ast *type) {
 	Ast *result = alloc_ast_node(f, Ast_PointerType);
 	result->PointerType.token = token;
@@ -1127,7 +1161,7 @@ CommentGroup *consume_comment_group(AstFile *f, isize n, isize *end_line_) {
 
 	CommentGroup *comments = nullptr;
 	if (list.count > 0) {
-		comments = gb_alloc_item(ast_allocator(), CommentGroup);
+		comments = gb_alloc_item(heap_allocator(), CommentGroup);
 		comments->list = list;
 		array_add(&f->comments, comments);
 	}
@@ -1160,12 +1194,15 @@ void comsume_comment_groups(AstFile *f, Token prev) {
 
 
 Token advance_token(AstFile *f) {
-	gb_zero_item(&f->lead_comment);
-	gb_zero_item(&f->line_comment);
+	f->lead_comment = nullptr;
+	f->line_comment = nullptr;
+
 	Token prev = f->prev_token = f->curr_token;
 
 	bool ok = next_token0(f);
-	if (ok) comsume_comment_groups(f, prev);
+	if (ok && f->curr_token.kind == Token_Comment) {
+		comsume_comment_groups(f, prev);
+	}
 	return prev;
 }
 
@@ -1611,6 +1648,7 @@ void parse_proc_tags(AstFile *f, u64 *tags) {
 		}
 
 		if (false) {}
+		ELSE_IF_ADD_TAG(optional_ok)
 		ELSE_IF_ADD_TAG(require_results)
 		ELSE_IF_ADD_TAG(bounds_check)
 		ELSE_IF_ADD_TAG(no_bounds_check)
@@ -1713,11 +1751,6 @@ Ast *parse_operand(AstFile *f, bool lhs) {
 	case Token_Rune:
 		return ast_basic_lit(f, advance_token(f));
 
-	case Token_size_of:
-	case Token_align_of:
-	case Token_offset_of:
-		return parse_call_expr(f, ast_implicit(f, advance_token(f)));
-
 	case Token_String:
 		return ast_basic_lit(f, advance_token(f));
 
@@ -1777,6 +1810,9 @@ Ast *parse_operand(AstFile *f, bool lhs) {
 		} else if (name.string == "defined") {
 			Ast *tag = ast_basic_directive(f, token, name.string);
 			return parse_call_expr(f, tag);
+		} else if (name.string == "config") {
+			Ast *tag = ast_basic_directive(f, token, name.string);
+			return parse_call_expr(f, tag);
 		} else if (name.string == "soa" || name.string == "simd") {
 			Ast *tag = ast_basic_directive(f, token, name.string);
 			Ast *original_type = parse_type(f);
@@ -1814,6 +1850,11 @@ Ast *parse_operand(AstFile *f, bool lhs) {
 				syntax_error(token, "#bounds_check and #no_bounds_check cannot be applied together");
 			}
 			return operand;
+		} else if (name.string == "relative") {
+			Ast *tag = ast_basic_directive(f, token, name.string);
+			tag = parse_call_expr(f, tag);
+			Ast *type = parse_type(f);
+			return ast_relative_type(f, tag, type);
 		} else {
 			operand = ast_tag_expr(f, token, name, parse_expr(f, false));
 		}
@@ -1988,17 +2029,6 @@ Ast *parse_operand(AstFile *f, bool lhs) {
 	case Token_typeid: {
 		Token token = expect_token(f, Token_typeid);
 		return ast_typeid_type(f, token, nullptr);
-	} break;
-
-	case Token_type_of: {
-		Ast *i = ast_implicit(f, expect_token(f, Token_type_of));
-		Ast *type = parse_call_expr(f, i);
-		while (f->curr_token.kind == Token_Period) {
-			Token token = advance_token(f);
-			Ast *sel = parse_ident(f);
-			type = ast_selector_expr(f, token, type, sel);
-		}
-		return type;
 	} break;
 
 	case Token_Pointer: {
@@ -2407,8 +2437,11 @@ Ast *parse_atom_expr(AstFile *f, Ast *operand, bool lhs) {
 
 		case Token_ArrowRight: {
 			Token token = advance_token(f);
-			syntax_error(token, "Selector expressions use '.' rather than '->'");
-			operand = ast_selector_expr(f, token, operand, parse_ident(f));
+			// syntax_error(token, "Selector expressions use '.' rather than '->'");
+
+			Ast *sel = ast_selector_expr(f, token, operand, parse_ident(f));
+			Ast *call = parse_call_expr(f, sel);
+			operand = ast_selector_call_expr(f, token, sel, call);
 			break;
 		}
 
@@ -2957,6 +2990,7 @@ Ast *parse_results(AstFile *f, bool *diverging) {
 ProcCallingConvention string_to_calling_convention(String s) {
 	if (s == "odin")        return ProcCC_Odin;
 	if (s == "contextless") return ProcCC_Contextless;
+	if (s == "pure")        return ProcCC_Pure;
 	if (s == "cdecl")       return ProcCC_CDecl;
 	if (s == "c")           return ProcCC_CDecl;
 	if (s == "stdcall")     return ProcCC_StdCall;
@@ -3864,7 +3898,7 @@ Ast *parse_import_decl(AstFile *f, ImportDeclKind kind) {
 	}
 
 	if (is_using) {
-		syntax_warning(import_name, "'using import' is deprecated, please use the import name explicitly");
+		syntax_error(import_name, "'using import' is not allowed, please use the import name explicitly");
 	}
 
 	expect_semicolon(f, s);
@@ -4253,8 +4287,15 @@ ParseFileError init_ast_file(AstFile *f, String fullpath, TokenPos *err_pos) {
 	}
 
 	isize file_size = f->tokenizer.end - f->tokenizer.start;
-	isize init_token_cap = cast(isize)gb_max(next_pow2(cast(i64)(file_size/2ll)), 16);
+
+	// NOTE(bill): Determine allocation size required for tokens
+	isize token_cap = file_size/3ll;
+	isize pow2_cap = gb_max(cast(isize)prev_pow2(cast(i64)token_cap)/2, 16);
+	token_cap = ((token_cap + pow2_cap-1)/pow2_cap) * pow2_cap;
+
+	isize init_token_cap = gb_max(token_cap, 16);
 	array_init(&f->tokens, heap_allocator(), 0, gb_max(init_token_cap, 16));
+	isize cap0 = f->tokens.capacity;
 
 	if (err == TokenizerInit_Empty) {
 		Token token = {Token_EOF};
@@ -4265,26 +4306,39 @@ ParseFileError init_ast_file(AstFile *f, String fullpath, TokenPos *err_pos) {
 		return ParseFile_None;
 	}
 
+	u64 start = time_stamp_time_now();
+
 	while (f->curr_token.kind != Token_EOF) {
-		Token token = tokenizer_get_token(&f->tokenizer);
-		if (token.kind == Token_Invalid) {
-			err_pos->line   = token.pos.line;
-			err_pos->column = token.pos.column;
+		Token *token = array_add_and_get(&f->tokens);
+		tokenizer_get_token(&f->tokenizer, token);
+		if (token->kind == Token_Invalid) {
+			err_pos->line   = token->pos.line;
+			err_pos->column = token->pos.column;
 			return ParseFile_InvalidToken;
 		}
-		array_add(&f->tokens, token);
 
-		if (token.kind == Token_EOF) {
+		if (token->kind == Token_EOF) {
 			break;
 		}
 	}
+
+	u64 end = time_stamp_time_now();
+	f->time_to_tokenize = cast(f64)(end-start)/cast(f64)time_stamp__freq();
 
 	f->curr_token_index = 0;
 	f->prev_token = f->tokens[f->curr_token_index];
 	f->curr_token = f->tokens[f->curr_token_index];
 
-	array_init(&f->comments, heap_allocator());
-	array_init(&f->imports, heap_allocator());
+	isize const page_size = 4*1024;
+	isize block_size = 2*f->tokens.count*gb_size_of(Ast);
+	block_size = ((block_size + page_size-1)/page_size) * page_size;
+	block_size = gb_clamp(block_size, page_size, ARENA_DEFAULT_BLOCK_SIZE);
+
+	arena_init(&f->arena, heap_allocator(), block_size);
+
+
+	array_init(&f->comments, heap_allocator(), 0, 0);
+	array_init(&f->imports,  heap_allocator(), 0, 0);
 
 	f->curr_proc = nullptr;
 
@@ -4303,7 +4357,7 @@ void destroy_ast_file(AstFile *f) {
 bool init_parser(Parser *p) {
 	GB_ASSERT(p != nullptr);
 	string_set_init(&p->imported_files, heap_allocator());
-	map_init(&p->package_map, heap_allocator());
+	string_map_init(&p->package_map, heap_allocator());
 	array_init(&p->packages, heap_allocator());
 	array_init(&p->package_imports, heap_allocator());
 	gb_mutex_init(&p->file_add_mutex);
@@ -4329,7 +4383,7 @@ void destroy_parser(Parser *p) {
 	array_free(&p->packages);
 	array_free(&p->package_imports);
 	string_set_destroy(&p->imported_files);
-	map_destroy(&p->package_map);
+	string_map_destroy(&p->package_map);
 	gb_mutex_destroy(&p->file_add_mutex);
 	gb_mutex_destroy(&p->file_decl_mutex);
 }
@@ -4339,8 +4393,8 @@ void parser_add_package(Parser *p, AstPackage *pkg) {
 	pkg->id = p->packages.count+1;
 	array_add(&p->packages, pkg);
 	if (pkg->name.len > 0) {
-		HashKey key = hash_string(pkg->name);
-		auto found = map_get(&p->package_map, key);
+		StringHashKey key = string_hash_string(pkg->name);
+		auto found = string_map_get(&p->package_map, key);
 		if (found) {
 			GB_ASSERT(pkg->files.count > 0);
 			AstFile *f = pkg->files[0];
@@ -4349,7 +4403,7 @@ void parser_add_package(Parser *p, AstPackage *pkg) {
 			TokenPos pos = (*found)->files[0]->package_token.pos;
 			error_line("\tpreviously declared at %.*s(%td:%td)\n", LIT(pos.file), pos.line, pos.column);
 		} else {
-			map_set(&p->package_map, key, pkg);
+			string_map_set(&p->package_map, key, pkg);
 		}
 	}
 }
@@ -4682,14 +4736,15 @@ void parse_setup_file_decls(Parser *p, AstFile *f, String base_dir, Array<Ast *>
 			for_array(fp_idx, fl->filepaths) {
 				String file_str = fl->filepaths[fp_idx].string;
 				String fullpath = file_str;
-
-				String foreign_path = {};
-				bool ok = determine_path_from_string(&p->file_decl_mutex, node, base_dir, file_str, &foreign_path);
-				if (!ok) {
-					decls[i] = ast_bad_decl(f, fl->filepaths[fp_idx], fl->filepaths[fl->filepaths.count-1]);
-					goto end;
+				if (build_context.metrics.os != TargetOs_js) {
+					String foreign_path = {};
+					bool ok = determine_path_from_string(&p->file_decl_mutex, node, base_dir, file_str, &foreign_path);
+					if (!ok) {
+						decls[i] = ast_bad_decl(f, fl->filepaths[fp_idx], fl->filepaths[fl->filepaths.count-1]);
+						goto end;
+					}
+					fullpath = foreign_path;
 				}
-				fullpath = foreign_path;
 				array_add(&fl->fullpaths, fullpath);
 			}
 			if (fl->fullpaths.count == 0) {
@@ -4805,9 +4860,13 @@ bool parse_file(Parser *p, AstFile *f) {
 		return true;
 	}
 
+	u64 start = time_stamp_time_now();
+
 	String filepath = f->tokenizer.fullpath;
 	String base_dir = dir_from_path(filepath);
-	comsume_comment_groups(f, f->prev_token);
+	if (f->curr_token.kind == Token_Comment) {
+		comsume_comment_groups(f, f->prev_token);
+	}
 
 	CommentGroup *docs = f->lead_comment;
 
@@ -4848,27 +4907,29 @@ bool parse_file(Parser *p, AstFile *f) {
 	expect_semicolon(f, pd);
 	f->pkg_decl = pd;
 
-	if (f->error_count > 0) {
-		return false;
-	}
+	if (f->error_count == 0) {
+		f->decls = array_make<Ast *>(heap_allocator());
 
-	f->decls = array_make<Ast *>(heap_allocator());
-
-	while (f->curr_token.kind != Token_EOF) {
-		Ast *stmt = parse_stmt(f);
-		if (stmt && stmt->kind != Ast_EmptyStmt) {
-			array_add(&f->decls, stmt);
-			if (stmt->kind == Ast_ExprStmt &&
-			    stmt->ExprStmt.expr != nullptr &&
-			    stmt->ExprStmt.expr->kind == Ast_ProcLit) {
-				syntax_error(stmt, "Procedure literal evaluated but not used");
+		while (f->curr_token.kind != Token_EOF) {
+			Ast *stmt = parse_stmt(f);
+			if (stmt && stmt->kind != Ast_EmptyStmt) {
+				array_add(&f->decls, stmt);
+				if (stmt->kind == Ast_ExprStmt &&
+				    stmt->ExprStmt.expr != nullptr &&
+				    stmt->ExprStmt.expr->kind == Ast_ProcLit) {
+					syntax_error(stmt, "Procedure literal evaluated but not used");
+				}
 			}
 		}
+
+		parse_setup_file_decls(p, f, base_dir, f->decls);
 	}
 
-	parse_setup_file_decls(p, f, base_dir, f->decls);
+	u64 end = time_stamp_time_now();
+	f->time_to_parse = cast(f64)(end-start)/cast(f64)time_stamp__freq();
 
-	return true;
+
+	return f->error_count == 0;
 }
 
 

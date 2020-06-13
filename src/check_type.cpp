@@ -335,6 +335,19 @@ void add_polymorphic_record_entity(CheckerContext *ctx, Ast *node, Type *named_t
 		array_add(&array, e);
 		map_set(&ctx->checker->info.gen_types, hash_pointer(original_type), array);
 	}
+
+	{
+		Type *dst_bt = base_type(named_type);
+		Type *src_bt = base_type(original_type);
+		if ((dst_bt != nullptr && src_bt != nullptr) &&
+		    (dst_bt->kind == src_bt->kind)){
+			if (dst_bt->kind == Type_Struct) {
+				if (dst_bt->Struct.atom_op_table == nullptr) {
+					dst_bt->Struct.atom_op_table = src_bt->Struct.atom_op_table;
+				}
+			}
+		}
+	}
 }
 
 void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *node, Array<Operand> *poly_operands, Type *named_type, Type *original_type_for_poly) {
@@ -469,7 +482,9 @@ void check_struct_type(CheckerContext *ctx, Type *struct_type, Ast *node, Array<
 								is_polymorphic = true;
 								can_check_fields = false;
 							}
-							e = alloc_entity_constant(scope, token, operand.type, operand.value);
+							if (e == nullptr) {
+								e = alloc_entity_constant(scope, token, operand.type, operand.value);
+							}
 						}
 					} else {
 						if (is_type_param) {
@@ -1672,11 +1687,19 @@ Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_params, bool *is
 						}
 					}
 					if (is_poly_name) {
-						if (op.mode == Addressing_Constant) {
-							poly_const = op.value;
-						} else {
-							error(op.expr, "Expected a constant value for this polymorphic name parameter");
-							success = false;
+						bool valid = false;
+						if (is_type_proc(op.type)) {
+							Entity *proc_entity = entity_from_expr(op.expr);
+							valid = proc_entity != nullptr;
+							poly_const = exact_value_procedure(proc_entity->identifier ? proc_entity->identifier : op.expr);
+						}
+						if (!valid) {
+							if (op.mode == Addressing_Constant) {
+								poly_const = op.value;
+							} else {
+								error(op.expr, "Expected a constant value for this polymorphic name parameter");
+								success = false;
+							}
 						}
 					}
 					if (is_type_untyped(default_type(type))) {
@@ -2429,10 +2452,18 @@ void set_procedure_abi_types(gbAllocator allocator, Type *type) {
 			switch (type->Proc.calling_convention) {
 			case ProcCC_Odin:
 			case ProcCC_Contextless:
+			case ProcCC_Pure:
 				if (is_type_pointer(new_type) & !is_type_pointer(e->type)) {
 					e->flags |= EntityFlag_ImplicitReference;
 				}
 				break;
+			}
+
+			if (build_context.ODIN_OS == "linux" ||
+			    build_context.ODIN_OS == "darwin") {
+				if (is_type_pointer(new_type) & !is_type_pointer(e->type)) {
+					e->flags |= EntityFlag_ByVal;
+				}
 			}
 		}
 	}
@@ -2471,6 +2502,21 @@ bool check_procedure_type(CheckerContext *ctx, Type *type, Ast *proc_type_node, 
 	c->curr_proc_sig = type;
 	c->in_proc_sig = true;
 
+
+	ProcCallingConvention cc = pt->calling_convention;
+	if (cc == ProcCC_ForeignBlockDefault) {
+		cc = ProcCC_CDecl;
+		if (c->foreign_context.default_cc > 0) {
+			cc = c->foreign_context.default_cc;
+		}
+	}
+	GB_ASSERT(cc > 0);
+	if (cc == ProcCC_Odin) {
+		c->scope->flags |= ScopeFlag_ContextDefined;
+	} else {
+		c->scope->flags &= ~ScopeFlag_ContextDefined;
+	}
+
 	bool variadic = false;
 	isize variadic_index = -1;
 	bool success = true;
@@ -2503,15 +2549,26 @@ bool check_procedure_type(CheckerContext *ctx, Type *type, Ast *proc_type_node, 
 		type->Proc.has_named_results = first->token.string != "";
 	}
 
+	if (result_count == 0 && cc == ProcCC_Pure) {
+		error(proc_type_node, "\"pure\" procedures must have at least 1 return value");
+	}
 
-	ProcCallingConvention cc = pt->calling_convention;
-	if (cc == ProcCC_ForeignBlockDefault) {
-		cc = ProcCC_CDecl;
-		if (c->foreign_context.default_cc > 0) {
-			cc = c->foreign_context.default_cc;
+
+	bool optional_ok = (pt->tags & ProcTag_optional_ok) != 0;
+	if (optional_ok) {
+		if (result_count != 2) {
+			error(proc_type_node, "A procedure type with the #optional_ok tag requires 2 return values, got %td", result_count);
+		} else {
+			Entity *second = results->Tuple.variables[1];
+			if (is_type_polymorphic(second->type)) {
+				// ignore
+			} else if (is_type_boolean(second->type)) {
+				// GOOD
+			} else {
+				error(second->token, "Second return value of an #optional_ok procedure must be a boolean, got %s", type_to_string(second->type));
+			}
 		}
 	}
-	GB_ASSERT(cc > 0);
 
 	type->Proc.node                 = proc_type_node;
 	type->Proc.scope                = c->scope;
@@ -2525,6 +2582,7 @@ bool check_procedure_type(CheckerContext *ctx, Type *type, Ast *proc_type_node, 
 	type->Proc.is_polymorphic       = pt->generic;
 	type->Proc.specialization_count = specialization_count;
 	type->Proc.diverging            = pt->diverging;
+	type->Proc.optional_ok          = optional_ok;
 	type->Proc.tags                 = pt->tags;
 
 	if (param_count > 0) {
@@ -3225,6 +3283,46 @@ bool check_type_internal(CheckerContext *ctx, Ast *e, Type **type, Type *named_t
 
 	case_ast_node(pt, PointerType, e);
 		*type = alloc_type_pointer(check_type(ctx, pt->type));
+		set_base_type(named_type, *type);
+		return true;
+	case_end;
+
+	case_ast_node(rt, RelativeType, e);
+		GB_ASSERT(rt->tag->kind == Ast_CallExpr);
+		ast_node(ce, CallExpr, rt->tag);
+
+		Type *base_integer = nullptr;
+
+		if (ce->args.count != 1) {
+			error(rt->type, "#relative expected 1 type argument, got %td", ce->args.count);
+		} else {
+			base_integer = check_type(ctx, ce->args[0]);
+			if (!is_type_integer(base_integer)) {
+				error(rt->type, "#relative base types must be an integer");
+				base_integer = nullptr;
+			} else if (type_size_of(base_integer) > 64) {
+				error(rt->type, "#relative base integer types be less than or equal to 64-bits");
+				base_integer = nullptr;
+			}
+		}
+
+		Type *relative_type = nullptr;
+		Type *base_type = check_type(ctx, rt->type);
+		if (!is_type_pointer(base_type) && !is_type_slice(base_type)) {
+			error(rt->type, "#relative types can only be a pointer or slice");
+			relative_type = base_type;
+		} else if (base_integer == nullptr) {
+			relative_type = base_type;
+		} else {
+			if (is_type_pointer(base_type)) {
+				relative_type = alloc_type_relative_pointer(base_type, base_integer);
+			} else if (is_type_slice(base_type)) {
+				relative_type = alloc_type_relative_slice(base_type, base_integer);
+			}
+		}
+		GB_ASSERT(relative_type != nullptr);
+
+		*type = relative_type;
 		set_base_type(named_type, *type);
 		return true;
 	case_end;

@@ -1,8 +1,9 @@
 package sync
 
-foreign {
-	@(link_name="llvm.x86.sse2.pause")
-	yield_processor :: proc() ---
+import "core:intrinsics"
+
+cpu_relax :: inline proc() {
+	intrinsics.cpu_relax();
 }
 
 Ticket_Mutex :: struct {
@@ -17,8 +18,8 @@ ticket_mutex_init :: proc(m: ^Ticket_Mutex) {
 
 ticket_mutex_lock :: inline proc(m: ^Ticket_Mutex) {
 	ticket := atomic_add(&m.ticket, 1, .Relaxed);
-	for ticket != m.serving {
-		yield_processor();
+	for ticket != atomic_load(&m.serving, .Acquire) {
+		intrinsics.cpu_relax();
 	}
 }
 

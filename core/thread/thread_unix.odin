@@ -2,6 +2,7 @@
 package thread;
 
 import "core:runtime"
+import "core:intrinsics"
 import "core:sync"
 import "core:sys/unix"
 
@@ -40,17 +41,10 @@ Thread_Priority :: enum {
 // Creates a thread which will run the given procedure.
 // It then waits for `start` to be called.
 //
-// You may provide a slice of bytes to use as the stack for the new thread,
-// but if you do, you are expected to set up the guard pages yourself.
-//
-// The stack must also be aligned appropriately for the platform.
-// We require it's at least 16 bytes aligned to help robustness; other
-// platforms may require page-size alignment.
-// Note also that pthreads requires the stack is at least 6 OS pages in size:
-// 4 are required by pthreads, and two extra for guards pages that will be applied.
-//
 create :: proc(procedure: Thread_Proc, priority := Thread_Priority.Normal) -> ^Thread {
 	__linux_thread_entry_proc :: proc "c" (t: rawptr) -> rawptr {
+		context = runtime.default_context();
+
 		t := (^Thread)(t);
 		sync.condition_wait_for(&t.start_gate);
 		sync.condition_destroy(&t.start_gate);
@@ -134,7 +128,7 @@ join :: proc(t: ^Thread) {
 	if sync.atomic_swap(&t.already_joined, true, .Sequentially_Consistent) {
 		for {
 			if sync.atomic_load(&t.done, .Sequentially_Consistent) do return;
-			sync.yield_processor();
+			intrinsics.cpu_relax();
 		}
 	}
 

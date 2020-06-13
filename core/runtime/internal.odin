@@ -2,6 +2,38 @@ package runtime
 
 import "core:os"
 
+bswap_16 :: proc "none" (x: u16) -> u16 {
+	return x>>8 | x<<8;
+}
+
+bswap_32 :: proc "none" (x: u32) -> u32 {
+	return x>>24 | (x>>8)&0xff00 | (x<<8)&0xff0000 | x<<24;
+}
+
+bswap_64 :: proc "none" (x: u64) -> u64 {
+	return u64(bswap_32(u32(x))) | u64(bswap_32(u32(x>>32)));
+}
+
+bswap_128 :: proc "none" (x: u128) -> u128 {
+	return u128(bswap_64(u64(x))) | u128(bswap_64(u64(x>>64)));
+}
+
+
+bswap_f32 :: proc "none" (f: f32) -> f32 {
+	x := transmute(u32)f;
+	z := x>>24 | (x>>8)&0xff00 | (x<<8)&0xff0000 | x<<24;
+	return transmute(f32)z;
+
+}
+
+bswap_f64 :: proc "none" (f: f64) -> f64 {
+	x := transmute(u64)f;
+	z := u64(bswap_32(u32(x))) | u64(bswap_32(u32(x>>32)));
+	return transmute(f64)z;
+}
+
+
+
 ptr_offset :: inline proc "contextless" (ptr: $P/^$T, n: int) -> P {
 	new := int(uintptr(ptr)) + size_of(T)*n;
 	return P(uintptr(new));
@@ -38,17 +70,6 @@ align_forward_uintptr :: inline proc(ptr, align: uintptr) -> uintptr {
 mem_zero :: proc "contextless" (data: rawptr, len: int) -> rawptr {
 	if data == nil do return nil;
 	if len < 0 do return data;
-	when !#defined(memset) {
-		foreign _ {
-			when size_of(rawptr) == 8 {
-				@(link_name="llvm.memset.p0i8.i64")
-				memset :: proc(dst: rawptr, val: byte, len: int, align: i32 = 1, is_volatile: bool = false) ---;
-			} else {
-				@(link_name="llvm.memset.p0i8.i32")
-				memset :: proc(dst: rawptr, val: byte, len: int, align: i32 = 1, is_volatile: bool = false) ---;
-			}
-		}
-	}
 	memset(data, 0, len);
 	return data;
 }
@@ -57,15 +78,25 @@ mem_copy :: proc "contextless" (dst, src: rawptr, len: int) -> rawptr {
 	if src == nil do return dst;
 	// NOTE(bill): This _must_ be implemented like C's memmove
 	foreign _ {
-		when size_of(rawptr) == 8 {
-			@(link_name="llvm.memmove.p0i8.p0i8.i64")
-			llvm_memmove :: proc(dst, src: rawptr, len: int, align: i32, is_volatile: bool) ---;
+		when ODIN_USE_LLVM_API {
+			when size_of(rawptr) == 8 {
+				@(link_name="llvm.memmove.p0i8.p0i8.i64")
+				llvm_memmove :: proc(dst, src: rawptr, len: int, is_volatile: bool = false) ---;
+			} else {
+				@(link_name="llvm.memmove.p0i8.p0i8.i32")
+				llvm_memmove :: proc(dst, src: rawptr, len: int, is_volatile: bool = false) ---;
+			}
 		} else {
-			@(link_name="llvm.memmove.p0i8.p0i8.i32")
-			llvm_memmove :: proc(dst, src: rawptr, len: int, align: i32, is_volatile: bool) ---;
+			when size_of(rawptr) == 8 {
+				@(link_name="llvm.memmove.p0i8.p0i8.i64")
+				llvm_memmove :: proc(dst, src: rawptr, len: int, align: i32 = 1, is_volatile: bool = false) ---;
+			} else {
+				@(link_name="llvm.memmove.p0i8.p0i8.i32")
+				llvm_memmove :: proc(dst, src: rawptr, len: int, align: i32 = 1, is_volatile: bool = false) ---;
+			}
 		}
 	}
-	llvm_memmove(dst, src, len, 1, false);
+	llvm_memmove(dst, src, len);
 	return dst;
 }
 
@@ -73,15 +104,25 @@ mem_copy_non_overlapping :: proc "contextless" (dst, src: rawptr, len: int) -> r
 	if src == nil do return dst;
 	// NOTE(bill): This _must_ be implemented like C's memcpy
 	foreign _ {
-		when size_of(rawptr) == 8 {
-			@(link_name="llvm.memcpy.p0i8.p0i8.i64")
-			llvm_memcpy :: proc(dst, src: rawptr, len: int, align: i32, is_volatile: bool) ---;
+		when ODIN_USE_LLVM_API {
+			when size_of(rawptr) == 8 {
+				@(link_name="llvm.memcpy.p0i8.p0i8.i64")
+				llvm_memcpy :: proc(dst, src: rawptr, len: int, is_volatile: bool = false) ---;
+			} else {
+				@(link_name="llvm.memcpy.p0i8.p0i8.i32")
+				llvm_memcpy :: proc(dst, src: rawptr, len: int, is_volatile: bool = false) ---;
+			}
 		} else {
-			@(link_name="llvm.memcpy.p0i8.p0i8.i32")
-			llvm_memcpy :: proc(dst, src: rawptr, len: int, align: i32, is_volatile: bool) ---;
+			when size_of(rawptr) == 8 {
+				@(link_name="llvm.memcpy.p0i8.p0i8.i64")
+				llvm_memcpy :: proc(dst, src: rawptr, len: int, align: i32 = 1, is_volatile: bool = false) ---;
+			} else {
+				@(link_name="llvm.memcpy.p0i8.p0i8.i32")
+				llvm_memcpy :: proc(dst, src: rawptr, len: int, align: i32 = 1, is_volatile: bool = false) ---;
+			}
 		}
 	}
-	llvm_memcpy(dst, src, len, 1, false);
+	llvm_memcpy(dst, src, len);
 	return dst;
 }
 
@@ -173,8 +214,12 @@ print_caller_location :: proc(fd: os.Handle, using loc: Source_Code_Location) {
 	os.write_byte(fd, ')');
 }
 print_typeid :: proc(fd: os.Handle, id: typeid) {
-	ti := type_info_of(id);
-	print_type(fd, ti);
+	if id == nil {
+		os.write_string(fd, "nil");
+	} else {
+		ti := type_info_of(id);
+		print_type(fd, ti);
+	}
 }
 print_type :: proc(fd: os.Handle, ti: ^Type_Info) {
 	if ti == nil {
@@ -397,6 +442,18 @@ print_type :: proc(fd: os.Handle, ti: ^Type_Info) {
 			os.write_byte(fd, ']');
 			print_type(fd, info.elem);
 		}
+
+	case Type_Info_Relative_Pointer:
+		os.write_string(fd, "#relative(");
+		print_type(fd, info.base_integer);
+		os.write_string(fd, ") ");
+		print_type(fd, info.pointer);
+
+	case Type_Info_Relative_Slice:
+		os.write_string(fd, "#relative(");
+		print_type(fd, info.base_integer);
+		os.write_string(fd, ") ");
+		print_type(fd, info.slice);
 	}
 }
 
@@ -529,6 +586,7 @@ quaternion256_ne :: inline proc "contextless" (a, b: quaternion256) -> bool { re
 bounds_check_error :: proc "contextless" (file: string, line, column: int, index, count: int) {
 	if 0 <= index && index < count do return;
 	handle_error :: proc "contextless" (file: string, line, column: int, index, count: int) {
+		context = default_context();
 		fd := os.stderr;
 		print_caller_location(fd, Source_Code_Location{file, line, column, "", 0});
 		os.write_string(fd, " Index ");
@@ -542,6 +600,7 @@ bounds_check_error :: proc "contextless" (file: string, line, column: int, index
 }
 
 slice_handle_error :: proc "contextless" (file: string, line, column: int, lo, hi: int, len: int) {
+	context = default_context();
 	fd := os.stderr;
 	print_caller_location(fd, Source_Code_Location{file, line, column, "", 0});
 	os.write_string(fd, " Invalid slice indices: ");
@@ -567,6 +626,7 @@ slice_expr_error_lo_hi :: proc "contextless" (file: string, line, column: int, l
 dynamic_array_expr_error :: proc "contextless" (file: string, line, column: int, low, high, max: int) {
 	if 0 <= low && low <= high && high <= max do return;
 	handle_error :: proc "contextless" (file: string, line, column: int, low, high, max: int) {
+		context = default_context();
 		fd := os.stderr;
 		print_caller_location(fd, Source_Code_Location{file, line, column, "", 0});
 		os.write_string(fd, " Invalid dynamic array values: ");
@@ -585,6 +645,7 @@ dynamic_array_expr_error :: proc "contextless" (file: string, line, column: int,
 type_assertion_check :: proc "contextless" (ok: bool, file: string, line, column: int, from, to: typeid) {
 	if ok do return;
 	handle_error :: proc "contextless" (file: string, line, column: int, from, to: typeid) {
+		context = default_context();
 		fd := os.stderr;
 		print_caller_location(fd, Source_Code_Location{file, line, column, "", 0});
 		os.write_string(fd, " Invalid type assertion from ");
@@ -697,6 +758,7 @@ dynamic_array_expr_error_loc :: inline proc "contextless" (using loc := #caller_
 make_slice_error_loc :: inline proc "contextless" (loc := #caller_location, len: int) {
 	if 0 <= len do return;
 	handle_error :: proc "contextless" (loc: Source_Code_Location, len: int) {
+		context = default_context();
 		fd := os.stderr;
 		print_caller_location(fd, loc);
 		os.write_string(fd, " Invalid slice length for make: ");
@@ -710,6 +772,7 @@ make_slice_error_loc :: inline proc "contextless" (loc := #caller_location, len:
 make_dynamic_array_error_loc :: inline proc "contextless" (using loc := #caller_location, len, cap: int) {
 	if 0 <= len && len <= cap do return;
 	handle_error :: proc "contextless" (loc: Source_Code_Location, len, cap: int) {
+		context = default_context();
 		fd := os.stderr;
 		print_caller_location(fd, loc);
 		os.write_string(fd, " Invalid dynamic array parameters for make: ");
@@ -725,6 +788,7 @@ make_dynamic_array_error_loc :: inline proc "contextless" (using loc := #caller_
 make_map_expr_error_loc :: inline proc "contextless" (loc := #caller_location, cap: int) {
 	if 0 <= cap do return;
 	handle_error :: proc "contextless" (loc: Source_Code_Location, cap: int) {
+		context = default_context();
 		fd := os.stderr;
 		print_caller_location(fd, loc);
 		os.write_string(fd, " Invalid map capacity for make: ");

@@ -282,6 +282,7 @@ Block_Stmt :: struct {
 	open:  tokenizer.Pos,
 	stmts: []^Stmt,
 	close: tokenizer.Pos,
+	uses_do: bool,
 }
 
 If_Stmt :: struct {
@@ -608,6 +609,7 @@ Union_Type :: struct {
 	variants:    []^Expr,
 	where_token: tokenizer.Token,
 	where_clauses: []^Expr,
+	is_maybe:	 bool,
 }
 
 Enum_Type :: struct {

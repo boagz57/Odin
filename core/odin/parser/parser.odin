@@ -214,17 +214,17 @@ consume_comment_group :: proc(p: ^Parser, n: int) -> (comments: ^ast.Comment_Gro
 	for p.curr_tok.kind == .Comment &&
 	    p.curr_tok.pos.line <= end_line+n {
 	    comment: tokenizer.Token;
-    	comment, end_line = consume_comment(p);
+		comment, end_line = consume_comment(p);
 		append(&list, comment);
-    }
+	}
 
-    if len(list) > 0 {
-    	comments = new(ast.Comment_Group);
-    	comments.list = list[:];
-    	append(&p.file.comments, comments);
-    }
+	if len(list) > 0 {
+		comments = new(ast.Comment_Group);
+		comments.list = list[:];
+		append(&p.file.comments, comments);
+	}
 
-    return;
+	return;
 }
 
 consume_comment_groups :: proc(p: ^Parser, prev: tokenizer.Token) {
@@ -1217,6 +1217,7 @@ convert_stmt_to_body :: proc(p: ^Parser, stmt: ^ast.Stmt) -> ^ast.Stmt {
 	bs.stmts = make([]^ast.Stmt, 1);
 	bs.stmts[0] = stmt;
 	bs.close = stmt.end;
+	bs.uses_do = true;
 	return bs;
 }
 
@@ -2223,6 +2224,7 @@ parse_operand :: proc(p: ^Parser, lhs: bool) -> ^ast.Expr {
 		tok := expect_token(p, .Union);
 		poly_params: ^ast.Field_List;
 		align:       ^ast.Expr;
+		is_maybe:    bool;
 
 		if allow_token(p, .Open_Paren) {
 			param_count: int;
@@ -2243,6 +2245,9 @@ parse_operand :: proc(p: ^Parser, lhs: bool) -> ^ast.Expr {
 			case "align":
 				if align != nil do error(p, tag.pos, "duplicate union tag '#%s'", tag.text);
 				align = parse_expr(p, true);
+			case "maybe":
+				if is_maybe do error(p, tag.pos, "duplicate union tag '#%s'", tag.text);
+				is_maybe = true;
 			case:
 				error(p, tag.pos, "invalid union tag '#%s", tag.text);
 			}
@@ -2281,6 +2286,7 @@ parse_operand :: proc(p: ^Parser, lhs: bool) -> ^ast.Expr {
 		ut.align         = align;
 		ut.where_token   = where_token;
 		ut.where_clauses = where_clauses;
+		ut.is_maybe      = is_maybe;
 
 		return ut;
 
@@ -2754,7 +2760,7 @@ parse_binary_expr :: proc(p: ^Parser, lhs: bool, prec_in: int) -> ^ast.Expr {
 			} else if op.kind == .When {
 				x := expr;
 				cond := parse_expr(p, lhs);
-				op2 := expect_token(p, .Else);
+				else_tok := expect_token(p, .Else);
 				y := parse_expr(p, lhs);
 				te := ast.new(ast.Ternary_When_Expr, expr.pos, end_pos(p.prev_tok));
 				te.x    = x;
